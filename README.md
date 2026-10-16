@@ -82,15 +82,28 @@ New-Item -ItemType Junction -Path "dsh-plugin-antigravity" -Target "C:\path\to\d
 
 ---
 
+## 🔑 授权与重新登录 (Re-OAuth)
+
+- **自动跳转**：初次加载时会通过系统底层进程管理器可靠唤起默认浏览器。
+- **重新认证入口 (Re-OAuth)**：
+  - **Web 管理页 / 重定向**：直接在浏览器访问 [http://localhost:8317/reauth](http://localhost:8317/reauth) 或 [http://localhost:8317/](http://localhost:8317/)，点击一键清除并跳转重新登录。
+  - **CLI 命令行**：执行 `node index.js reauth` 或 `node index.js logout`。
+  - **无头 / 远程服务器**：终端会自动打印出完整的 OAuth 登录 URL，并支持在控制台手动粘贴重定向后的地址或 `code` 自动换取 Token。
+
+---
+
 ## 💻 独立调试与预授权
 
 如果你想在不启动 DSH 的情况下预先完成 Google 账号授权或作为独立代理使用，直接运行：
 
 ```bash
 node index.js
+# 强制重新认证
+node index.js reauth
 ```
 
 服务将启动在 `http://127.0.0.1:8317`：
+- Web 管理与 Re-OAuth: `http://127.0.0.1:8317/` / `http://127.0.0.1:8317/reauth`
 - OpenAI Chat: `POST http://127.0.0.1:8317/v1/chat/completions`
 - Anthropic Messages: `POST http://127.0.0.1:8317/v1/messages`
 - Model List: `GET http://127.0.0.1:8317/v1/models`

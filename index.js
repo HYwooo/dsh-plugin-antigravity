@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { exec } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 
 export const name = 'antigravity-bridge';
@@ -45,6 +45,18 @@ export function saveTokens(tokens) {
   fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2), 'utf8');
 }
 
+export function clearTokens() {
+  if (fs.existsSync(TOKEN_PATH)) {
+    try {
+      fs.unlinkSync(TOKEN_PATH);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 export function getAuthUrl() {
   return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(
     REDIRECT_URI
@@ -52,35 +64,36 @@ export function getAuthUrl() {
 }
 
 /**
- * 跨平台安全拉起系统默认浏览器（支持 Windows / macOS / Linux GUI / WSL / 无头服务器容错）
+ * 跨平台可靠拉起系统默认浏览器（直接传递参数数组，彻底避免 shell 针对 & 字符的错误解析）
  */
-export function tryOpenBrowser(url, logger = console) {
+export function openBrowser(url, logger = console) {
   const platform = process.platform;
-  let cmd = '';
+  let child;
 
-  if (platform === 'darwin') {
-    cmd = `open "${url}"`;
-  } else if (platform === 'win32') {
-    // 使用 PowerShell Start-Process 避免 cmd 中 & 字符被当做命令管道符
-    cmd = `powershell -NoProfile -Command "Start-Process '${url.replace(/'/g, "''")}'"`;
-  } else {
-    // Linux / BSD / WSL / 容器
-    if (process.env.WSL_DISTRO_NAME) {
-      cmd = `cmd.exe /c start "" "${url}"`;
-    } else if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
-      cmd = `xdg-open "${url}"`;
+  try {
+    if (platform === 'darwin') {
+      child = spawn('open', [url], { detached: true, stdio: 'ignore' });
+    } else if (platform === 'win32') {
+      // 使用 rundll32.exe url.dll,FileProtocolHandler 避免 cmd 内部对 & 符号的截断
+      child = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], { detached: true, stdio: 'ignore' });
     } else {
-      // 纯无头 Linux / SSH 会话，无 GUI
-      logger.info?.('[Antigravity] 检测到无头环境 (Headless)，已跳过自动唤起浏览器，请复制控制台链接至外部浏览器打开。');
-      return;
+      // Linux / WSL / BSD
+      if (process.env.WSL_DISTRO_NAME) {
+        child = spawn('cmd.exe', ['/c', 'start', '', url.replace(/&/g, '^&')], { detached: true, stdio: 'ignore' });
+      } else {
+        child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
+      }
     }
-  }
 
-  exec(cmd, (err) => {
-    if (err) {
-      logger.warn?.(`[Antigravity] 自动唤起系统浏览器失败: ${err.message}。请直接使用控制台提供的 URL 访问。`);
+    if (child) {
+      child.on('error', (err) => {
+        logger.warn?.(`[Antigravity] 唤起系统浏览器失败: ${err.message}`);
+      });
+      child.unref();
     }
-  });
+  } catch (e) {
+    logger.warn?.(`[Antigravity] 打开浏览器时异常: ${e.message}`);
+  }
 }
 
 /**
@@ -110,11 +123,18 @@ export async function exchangeCodeForTokens(code) {
   return tokens;
 }
 
+let activeAuthServer = null;
+
 /**
- * 触发 Google OAuth 授权流程
+ * 启动 Google OAuth 授权监听流程
  */
 export function triggerOAuthLogin(logger = console) {
   return new Promise((resolve, reject) => {
+    if (activeAuthServer) {
+      try { activeAuthServer.close(); } catch {}
+      activeAuthServer = null;
+    }
+
     let resolved = false;
     let rl = null;
 
@@ -122,7 +142,10 @@ export function triggerOAuthLogin(logger = console) {
       if (rl) {
         try { rl.close(); } catch {}
       }
-      try { authServer.close(); } catch {}
+      if (activeAuthServer) {
+        try { activeAuthServer.close(); } catch {}
+        activeAuthServer = null;
+      }
     };
 
     const authServer = http.createServer(async (req, res) => {
@@ -148,7 +171,7 @@ export function triggerOAuthLogin(logger = console) {
                 <div style="text-align: center; background: #1e293b; padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); max-width: 480px;">
                   <h1 style="color: #38bdf8; margin-bottom: 12px; font-size: 24px;">✅ Google Antigravity 授权成功</h1>
                   <p style="color: #94a3b8; font-size: 15px; line-height: 1.6;">凭证已保存至 <code>~/.dsh/antigravity_tokens.json</code></p>
-                  <p style="color: #64748b; font-size: 14px; margin-top: 24px;">您可以关闭此页面，DeepSeek Harness 将自动开始桥接使用。</p>
+                  <p style="color: #64748b; font-size: 14px; margin-top: 24px;">您可以关闭此页面，DeepSeek Harness 将自动完成桥接。</p>
                 </div>
               </body>
             </html>
@@ -158,28 +181,30 @@ export function triggerOAuthLogin(logger = console) {
           resolve(tokens);
         } catch (err) {
           res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(`<h2>❌ 授权出错: ${err.message}</h2>`);
+          res.end(`<h2>❌ 换取 Token 出错: ${err.message}</h2>`);
           cleanup();
           reject(err);
         }
       }
     });
 
+    activeAuthServer = authServer;
+
     authServer.listen(AUTH_PORT, () => {
       const authUrl = getAuthUrl();
 
       console.log('\n================================================================================');
-      console.log('🔗 [Google OAuth 授权] 请在浏览器中打开以下链接完成登录授权：');
+      console.log('🔗 [Google OAuth 授权] 正在拉起浏览器，如未自动跳转请点击打开以下链接：');
       console.log(`\x1b[36m${authUrl}\x1b[0m`);
       console.log('================================================================================\n');
 
-      // 尝试自动呼起默认浏览器
-      tryOpenBrowser(authUrl, logger);
+      // 自动唤起浏览器
+      openBrowser(authUrl, logger);
 
-      // 如果是在终端交互模式下（如 SSH / 无头 Linux / 容器），提供手动粘贴 Code 的兜底通道
+      // 终端交互备用通道
       if (process.stdin.isTTY && !resolved) {
         rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        rl.question('👉 [备用通道] 如果是远程服务器或浏览器未能自动跳转，请将授权完成后的完整重定向地址或 code 粘贴于此按回车:\n> ', async (input) => {
+        rl.question('👉 [备用通道] 若页面未能自动回调，请将地址栏中的完整重定向链接或 code 粘贴于此并回车:\n> ', async (input) => {
           if (resolved) return;
           const trimmed = input.trim();
           if (!trimmed) return;
@@ -255,7 +280,6 @@ export async function getValidToken(logger = console) {
     logger.warn?.(`[Antigravity] Token 刷新失败，尝试重新登录: ${e.message}`);
   }
 
-  // 如果刷新失败，重新拉起一次登录
   tokens = await triggerOAuthLogin(logger);
   return tokens.access_token;
 }
@@ -318,7 +342,13 @@ async function handleOpenAIChat(req, res, logger) {
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*',
         });
-        res.end(JSON.stringify({ error: { message: errorText, code: upstream.status } }));
+        res.end(JSON.stringify({
+          error: {
+            message: `[Antigravity] 请求上游失败: ${errorText}。若需重新授权请在浏览器打开: http://127.0.0.1:8317/reauth`,
+            reauth_url: 'http://127.0.0.1:8317/reauth',
+            code: upstream.status,
+          },
+        }));
         return;
       }
 
@@ -376,7 +406,7 @@ async function handleOpenAIChat(req, res, logger) {
                 }
               }
             } catch {
-              // 忽略中间数据行解析异常
+              // ignore
             }
           }
         }
@@ -412,7 +442,12 @@ async function handleOpenAIChat(req, res, logger) {
       }
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ error: { message: err.message } }));
+      res.end(JSON.stringify({
+        error: {
+          message: `${err.message}。若需重新授权请在浏览器打开: http://127.0.0.1:8317/reauth`,
+          reauth_url: 'http://127.0.0.1:8317/reauth',
+        },
+      }));
     }
   });
 }
@@ -471,7 +506,13 @@ async function handleAnthropicMessages(req, res, logger) {
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*',
         });
-        res.end(JSON.stringify({ type: 'error', error: { message: errorText } }));
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            message: `[Antigravity] 上游调用失败: ${errorText}。请在浏览器打开 http://127.0.0.1:8317/reauth 重新完成授权`,
+            reauth_url: 'http://127.0.0.1:8317/reauth',
+          },
+        }));
         return;
       }
 
@@ -570,14 +611,17 @@ async function handleAnthropicMessages(req, res, logger) {
       }
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ type: 'error', error: { message: err.message } }));
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          message: `${err.message}。若需重新授权请在浏览器打开: http://127.0.0.1:8317/reauth`,
+          reauth_url: 'http://127.0.0.1:8317/reauth',
+        },
+      }));
     }
   });
 }
 
-/**
- * 完整模型列表定义
- */
 const DEFAULT_MODELS = [
   'gemini-2.5-pro',
   'gemini-2.5-flash',
@@ -601,20 +645,19 @@ export function apply(ctx, config) {
   // 1. 检查或触发登录凭证
   const tokens = loadTokens();
   if (!tokens || !tokens.refresh_token) {
-    logger.info?.('[Antigravity] 检测到尚未绑定 Google 账号，准备进行授权...') ||
+    logger.info?.('[Antigravity] 检测到尚未绑定 Google 账号，准备进行首次授权...') ||
       console.log('[Antigravity] 首次启动，准备进行 Google 账号授权...');
     triggerOAuthLogin(logger).catch((e) => {
       logger.error?.(`[Antigravity] 授权初始化失败: ${e.message}`) ||
         console.error('[Antigravity] 授权失败:', e);
     });
   } else {
-    logger.info?.('[Antigravity] 已加载本地用量凭据，自动桥接中...') ||
-      console.log('[Antigravity] 已加载本地用量凭据');
+    const msg = `[Antigravity] 已加载本地用量凭据。若需重新授权 (Re-OAuth) 请访问: http://127.0.0.1:${port}/reauth`;
+    logger.info?.(msg) || console.log(msg);
   }
 
-  // 2. 启动本地双协议监听服务 (OpenAI + Anthropic)
+  // 2. 启动本地双协议监听服务 (OpenAI + Anthropic + Re-OAuth 路由)
   const server = http.createServer((req, res) => {
-    // 跨域处理
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -627,19 +670,26 @@ export function apply(ctx, config) {
 
     const pathname = req.url.split('?')[0];
 
-    // 便捷 Web 授权重定向 (任意浏览器访问 http://127.0.0.1:8317/auth 即直接跳转 Google)
-    if (pathname === '/auth' || pathname === '/login') {
-      res.writeHead(302, { Location: getAuthUrl() });
+    // Re-OAuth 重新授权入口（支持 /reauth, /re-oauth, /auth, /login）
+    if (pathname === '/reauth' || pathname === '/re-oauth' || pathname === '/auth' || pathname === '/login') {
+      clearTokens();
+      // 启动回调接收
+      triggerOAuthLogin(logger).catch(() => {});
+      const authUrl = getAuthUrl();
+      res.writeHead(302, { Location: authUrl });
       res.end();
       return;
     }
-    // 便捷登出重置
+    // 登出入口
     else if (pathname === '/logout') {
-      if (fs.existsSync(TOKEN_PATH)) {
-        try { fs.unlinkSync(TOKEN_PATH); } catch {}
-      }
+      clearTokens();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<h3>✅ 已成功清除本地 Antigravity Token 凭据。请重新访问 /auth 授权。</h3>');
+      res.end(`
+        <div style="font-family: system-ui; text-align: center; margin-top: 50px;">
+          <h2>✅ 已成功清除本地 Antigravity Token 凭据</h2>
+          <p><a href="/reauth" style="display: inline-block; margin-top: 15px; padding: 10px 20px; background: #0284c7; color: #fff; text-decoration: none; border-radius: 6px;">👉 点击重新授权登录 (Re-OAuth)</a></p>
+        </div>
+      `);
       return;
     }
     // OpenAI Chat Completions 协议
@@ -668,10 +718,26 @@ export function apply(ctx, config) {
         })
       );
     }
-    // 健康探针
+    // 健康探针及管理主页
     else if (pathname === '/health' || pathname === '/') {
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ status: 'ok', service: 'dsh-plugin-antigravity' }));
+      const hasToken = fs.existsSync(TOKEN_PATH);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end(`
+        <div style="font-family: system-ui; max-width: 600px; margin: 40px auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px; background: #fafafa;">
+          <h2 style="color: #0f172a;">🚀 Antigravity Bridge 服务运行中</h2>
+          <p>当前凭证状态：<strong>${hasToken ? '✅ 已绑定 Token' : '⚠️ 未绑定 Token'}</strong></p>
+          <div style="margin-top: 20px;">
+            <a href="/reauth" style="display: inline-block; padding: 8px 16px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 6px; margin-right: 10px;">🔄 重新授权 (Re-OAuth)</a>
+            <a href="/logout" style="display: inline-block; padding: 8px 16px; background: #dc2626; color: #fff; text-decoration: none; border-radius: 6px;">🚪 清除登录 (Logout)</a>
+          </div>
+          <hr style="margin: 25px 0; border: none; border-top: 1px solid #e2e8f0;" />
+          <ul style="color: #475569; font-size: 14px; line-height: 1.8;">
+            <li>OpenAI 端点: <code>http://127.0.0.1:${port}/v1/chat/completions</code></li>
+            <li>Anthropic 端点: <code>http://127.0.0.1:${port}/v1/messages</code></li>
+            <li>模型列表: <code>http://127.0.0.1:${port}/v1/models</code></li>
+          </ul>
+        </div>
+      `);
     } else {
       res.writeHead(404);
       res.end('Not Found');
@@ -699,11 +765,12 @@ export function apply(ctx, config) {
   }
 }
 
-// 允许通过命令行单独运行 (node index.js / node index.js login / node index.js logout)
+// 命令行直接调用入口 (node index.js / node index.js reauth / node index.js logout)
 if (process.argv[1] && process.argv[1].endsWith('index.js')) {
   const arg = process.argv[2];
-  if (arg === 'login' || arg === '--login') {
-    console.log('🔄 强制重新开始 Google OAuth 授权流程...');
+  if (arg === 'login' || arg === '--login' || arg === 'reauth' || arg === '--reauth') {
+    console.log('🔄 开始重新进行 Google OAuth 授权流程 (Re-OAuth)...');
+    clearTokens();
     triggerOAuthLogin(console)
       .then(() => {
         console.log('✅ 授权成功完成！');
@@ -714,13 +781,8 @@ if (process.argv[1] && process.argv[1].endsWith('index.js')) {
         process.exit(1);
       });
   } else if (arg === 'logout' || arg === '--logout') {
-    if (fs.existsSync(TOKEN_PATH)) {
-      try {
-        fs.unlinkSync(TOKEN_PATH);
-        console.log('✅ 已成功清除本地 Token 凭证:', TOKEN_PATH);
-      } catch (e) {
-        console.error('❌ 清除失败:', e.message);
-      }
+    if (clearTokens()) {
+      console.log('✅ 已成功清除本地 Token 凭据:', TOKEN_PATH);
     } else {
       console.log('ℹ️ 本地未发现 Token 凭据文件');
     }

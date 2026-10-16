@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-antigravity",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DeepSeek Harness plugin for Google Antigravity quota bridge",
   "type": "module",
   "main": "index.js",
