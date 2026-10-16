@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { exec } from 'node:child_process';
+import readline from 'node:readline';
 
 export const name = 'antigravity-bridge';
 export const inject = [];
@@ -44,11 +45,86 @@ export function saveTokens(tokens) {
   fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2), 'utf8');
 }
 
+export function getAuthUrl() {
+  return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(
+    REDIRECT_URI
+  )}&response_type=code&scope=${encodeURIComponent(SCOPES)}&access_type=offline&prompt=consent`;
+}
+
 /**
- * 首次使用时拉起浏览器进行一次性 Google OAuth 授权
+ * 跨平台安全拉起系统默认浏览器（支持 Windows / macOS / Linux GUI / WSL / 无头服务器容错）
+ */
+export function tryOpenBrowser(url, logger = console) {
+  const platform = process.platform;
+  let cmd = '';
+
+  if (platform === 'darwin') {
+    cmd = `open "${url}"`;
+  } else if (platform === 'win32') {
+    // 使用 PowerShell Start-Process 避免 cmd 中 & 字符被当做命令管道符
+    cmd = `powershell -NoProfile -Command "Start-Process '${url.replace(/'/g, "''")}'"`;
+  } else {
+    // Linux / BSD / WSL / 容器
+    if (process.env.WSL_DISTRO_NAME) {
+      cmd = `cmd.exe /c start "" "${url}"`;
+    } else if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
+      cmd = `xdg-open "${url}"`;
+    } else {
+      // 纯无头 Linux / SSH 会话，无 GUI
+      logger.info?.('[Antigravity] 检测到无头环境 (Headless)，已跳过自动唤起浏览器，请复制控制台链接至外部浏览器打开。');
+      return;
+    }
+  }
+
+  exec(cmd, (err) => {
+    if (err) {
+      logger.warn?.(`[Antigravity] 自动唤起系统浏览器失败: ${err.message}。请直接使用控制台提供的 URL 访问。`);
+    }
+  });
+}
+
+/**
+ * 通过 code 换取并保存 Token
+ */
+export async function exchangeCodeForTokens(code) {
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      redirect_uri: REDIRECT_URI,
+      grant_type: 'authorization_code',
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    const errBody = await tokenRes.text();
+    throw new Error(`换取 Token 失败 (${tokenRes.status}): ${errBody}`);
+  }
+
+  const tokens = await tokenRes.json();
+  tokens.expires_at = Date.now() + (tokens.expires_in || 3600) * 1000;
+  saveTokens(tokens);
+  return tokens;
+}
+
+/**
+ * 触发 Google OAuth 授权流程
  */
 export function triggerOAuthLogin(logger = console) {
   return new Promise((resolve, reject) => {
+    let resolved = false;
+    let rl = null;
+
+    const cleanup = () => {
+      if (rl) {
+        try { rl.close(); } catch {}
+      }
+      try { authServer.close(); } catch {}
+    };
+
     const authServer = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost:${AUTH_PORT}`);
       if (url.pathname === '/oauth/callback') {
@@ -56,31 +132,13 @@ export function triggerOAuthLogin(logger = console) {
         if (!code) {
           res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end('<h2>❌ 授权失败：未收到授权码</h2>');
+          cleanup();
           return reject(new Error('未接收到 OAuth Code'));
         }
 
         try {
-          const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-              code,
-              client_id: CLIENT_ID,
-              client_secret: CLIENT_SECRET,
-              redirect_uri: REDIRECT_URI,
-              grant_type: 'authorization_code',
-            }),
-          });
-
-          if (!tokenRes.ok) {
-            const errBody = await tokenRes.text();
-            throw new Error(`换取 Token 失败 (${tokenRes.status}): ${errBody}`);
-          }
-
-          const tokens = await tokenRes.json();
-          tokens.expires_at = Date.now() + (tokens.expires_in || 3600) * 1000;
-          saveTokens(tokens);
-
+          const tokens = await exchangeCodeForTokens(code);
+          resolved = true;
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(`
             <!DOCTYPE html>
@@ -95,32 +153,64 @@ export function triggerOAuthLogin(logger = console) {
               </body>
             </html>
           `);
-
-          authServer.close();
-          logger.info?.('[Antigravity] OAuth 授权成功，用量凭证已持久化！') || console.log('[Antigravity] OAuth 授权成功！');
+          cleanup();
+          logger.info?.('[Antigravity] OAuth 授权成功，用量凭证已持久化！') || console.log('\n✅ [Antigravity] OAuth 授权成功！');
           resolve(tokens);
         } catch (err) {
           res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(`<h2>❌ 授权出错: ${err.message}</h2>`);
+          cleanup();
           reject(err);
         }
       }
     });
 
     authServer.listen(AUTH_PORT, () => {
-      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(
-        REDIRECT_URI
-      )}&response_type=code&scope=${encodeURIComponent(SCOPES)}&access_type=offline&prompt=consent`;
+      const authUrl = getAuthUrl();
 
-      logger.info?.(`[Antigravity] 正在打开浏览器进行 Google 授权: ${authUrl}`) || console.log(`[Antigravity] 正在打开浏览器授权: ${authUrl}`);
-      const startCmd = process.platform === 'win32' ? `start "" "${authUrl}"` : process.platform === 'darwin' ? `open "${authUrl}"` : `xdg-open "${authUrl}"`;
-      exec(startCmd);
+      console.log('\n================================================================================');
+      console.log('🔗 [Google OAuth 授权] 请在浏览器中打开以下链接完成登录授权：');
+      console.log(`\x1b[36m${authUrl}\x1b[0m`);
+      console.log('================================================================================\n');
+
+      // 尝试自动呼起默认浏览器
+      tryOpenBrowser(authUrl, logger);
+
+      // 如果是在终端交互模式下（如 SSH / 无头 Linux / 容器），提供手动粘贴 Code 的兜底通道
+      if (process.stdin.isTTY && !resolved) {
+        rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question('👉 [备用通道] 如果是远程服务器或浏览器未能自动跳转，请将授权完成后的完整重定向地址或 code 粘贴于此按回车:\n> ', async (input) => {
+          if (resolved) return;
+          const trimmed = input.trim();
+          if (!trimmed) return;
+          let code = trimmed;
+          if (trimmed.includes('code=')) {
+            try {
+              const parsed = new URL(trimmed.startsWith('http') ? trimmed : `http://localhost/${trimmed}`);
+              code = parsed.searchParams.get('code') || code;
+            } catch {}
+          }
+          try {
+            console.log('正在解析 Code 换取 Token...');
+            const tokens = await exchangeCodeForTokens(code);
+            resolved = true;
+            cleanup();
+            console.log('✅ 手动授权成功，凭证已就绪！');
+            resolve(tokens);
+          } catch (e) {
+            console.error('❌ 手动授权失败:', e.message);
+            cleanup();
+            reject(e);
+          }
+        });
+      }
     });
 
     authServer.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
         logger.warn?.(`[Antigravity] 端口 ${AUTH_PORT} 已被占用，可能已在等待回调`);
       } else {
+        cleanup();
         reject(err);
       }
     });
@@ -268,7 +358,6 @@ async function handleOpenAIChat(req, res, logger) {
 
               for (const part of parts) {
                 if (part.thought) {
-                  // 思维链输出 (OpenAI 兼容 reasoning_content)
                   res.write(`data: ${JSON.stringify({
                     id: completionId,
                     object: 'chat.completion.chunk',
@@ -287,7 +376,7 @@ async function handleOpenAIChat(req, res, logger) {
                 }
               }
             } catch {
-              // 忽略非 JSON 数据行
+              // 忽略中间数据行解析异常
             }
           }
         }
@@ -302,7 +391,6 @@ async function handleOpenAIChat(req, res, logger) {
         res.write('data: [DONE]\n\n');
         res.end();
       } else {
-        // 非流式输出
         const rawResponse = await upstream.text();
         res.writeHead(200, {
           'Content-Type': 'application/json',
@@ -398,7 +486,6 @@ async function handleAnthropicMessages(req, res, logger) {
           'Access-Control-Allow-Origin': '*',
         });
 
-        // Anthropic 开始事件
         res.write(`event: message_start\ndata: ${JSON.stringify({
           type: 'message_start',
           message: {
@@ -514,7 +601,7 @@ export function apply(ctx, config) {
   // 1. 检查或触发登录凭证
   const tokens = loadTokens();
   if (!tokens || !tokens.refresh_token) {
-    logger.info?.('[Antigravity] 检测到尚未绑定 Google 账号，准备拉起授权...') ||
+    logger.info?.('[Antigravity] 检测到尚未绑定 Google 账号，准备进行授权...') ||
       console.log('[Antigravity] 首次启动，准备进行 Google 账号授权...');
     triggerOAuthLogin(logger).catch((e) => {
       logger.error?.(`[Antigravity] 授权初始化失败: ${e.message}`) ||
@@ -540,8 +627,23 @@ export function apply(ctx, config) {
 
     const pathname = req.url.split('?')[0];
 
+    // 便捷 Web 授权重定向 (任意浏览器访问 http://127.0.0.1:8317/auth 即直接跳转 Google)
+    if (pathname === '/auth' || pathname === '/login') {
+      res.writeHead(302, { Location: getAuthUrl() });
+      res.end();
+      return;
+    }
+    // 便捷登出重置
+    else if (pathname === '/logout') {
+      if (fs.existsSync(TOKEN_PATH)) {
+        try { fs.unlinkSync(TOKEN_PATH); } catch {}
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<h3>✅ 已成功清除本地 Antigravity Token 凭据。请重新访问 /auth 授权。</h3>');
+      return;
+    }
     // OpenAI Chat Completions 协议
-    if (req.method === 'POST' && (pathname === '/v1/chat/completions' || pathname === '/chat/completions')) {
+    else if (req.method === 'POST' && (pathname === '/v1/chat/completions' || pathname === '/chat/completions')) {
       handleOpenAIChat(req, res, logger);
     }
     // Anthropic Messages 协议
@@ -597,7 +699,33 @@ export function apply(ctx, config) {
   }
 }
 
-// 允许通过命令行单独运行 (node index.js)
+// 允许通过命令行单独运行 (node index.js / node index.js login / node index.js logout)
 if (process.argv[1] && process.argv[1].endsWith('index.js')) {
-  apply({ logger: console }, {});
+  const arg = process.argv[2];
+  if (arg === 'login' || arg === '--login') {
+    console.log('🔄 强制重新开始 Google OAuth 授权流程...');
+    triggerOAuthLogin(console)
+      .then(() => {
+        console.log('✅ 授权成功完成！');
+        process.exit(0);
+      })
+      .catch((err) => {
+        console.error('❌ 授权失败:', err.message);
+        process.exit(1);
+      });
+  } else if (arg === 'logout' || arg === '--logout') {
+    if (fs.existsSync(TOKEN_PATH)) {
+      try {
+        fs.unlinkSync(TOKEN_PATH);
+        console.log('✅ 已成功清除本地 Token 凭证:', TOKEN_PATH);
+      } catch (e) {
+        console.error('❌ 清除失败:', e.message);
+      }
+    } else {
+      console.log('ℹ️ 本地未发现 Token 凭据文件');
+    }
+    process.exit(0);
+  } else {
+    apply({ logger: console }, {});
+  }
 }
