@@ -1,0 +1,32 @@
+{
+  "name": "dsh-plugin-antigravity",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness plugin for Google Antigravity quota bridge",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "antigravity",
+    "gemini"
+  ],
+  "license": "MIT"
+}

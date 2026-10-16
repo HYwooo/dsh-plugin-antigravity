@@ -1,0 +1,4 @@
+# dsh-plugin-antigravity bundle patch
+- insert:
+    - id: antigravity-bridge
+      name: 'dsh-plugin-antigravity'
